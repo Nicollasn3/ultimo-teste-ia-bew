@@ -1,0 +1,3 @@
+"""
+Rotas da API.
+"""
