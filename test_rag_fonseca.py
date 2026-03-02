@@ -421,10 +421,9 @@ def main() -> int:
     print("\n[RETRIEVAL] Codificando perguntas de teste...")
     device = _escolher_device()
 
-    # Carrega o modelo novamente para as queries (ou mantém em memória se não foi deletado)
-    # (Se não criamos embeddings acima, o modelo ainda não foi carregado)
-    if cached:
-        tokenizer, model = carregar_modelo_embedding(device)
+    # Recarrega o modelo para as queries (sempre necessário: se não usou cache o model foi
+    # deletado após gerar embeddings; se usou cache nunca foi carregado ainda)
+    tokenizer, model = carregar_modelo_embedding(device)
 
     instrucao_query = (
         "Instruct: Recuperar trechos do livro que respondam à pergunta.\nQuery: "
