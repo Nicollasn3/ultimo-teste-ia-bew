@@ -164,7 +164,7 @@ def carregar_modelo_embedding(device: str) -> Tuple[AutoTokenizer, AutoModel]:
     model = AutoModel.from_pretrained(
         EMBEDDING_MODEL,
         trust_remote_code=True,
-        torch_dtype=dtype,
+        dtype=dtype,
     ).to(device)
     model.eval()
     print(f"[EMBED] Modelo carregado. Parâmetros: {sum(p.numel() for p in model.parameters()):,}")
