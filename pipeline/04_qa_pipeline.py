@@ -379,7 +379,8 @@ def run_qa(
     print(f"[04] Vetores no índice: {index.ntotal}")
 
     # ------------------------------------------------------------------
-    # Modelo de embeddings (query side)
+    # FASE 1 — Modelo de embeddings: gera todos os embeddings e faz
+    # retrieval ANTES de carregar o modelo de geração (evita OOM).
     # ------------------------------------------------------------------
     print(f"\n[04] Carregando tokenizer de embeddings: {embed_model_name}")
     emb_tokenizer = AutoTokenizer.from_pretrained(embed_model_name, trust_remote_code=True)
@@ -393,8 +394,24 @@ def run_qa(
     emb_model.eval()
     print(f"[04] Embed model device: {next(emb_model.parameters()).device}")
 
+    print(f"\n[04] Gerando embeddings das {len(QUESTIONS)} perguntas e fazendo retrieval...")
+    retrieved_per_question: List[List[Dict[str, Any]]] = []
+    for q_meta in QUESTIONS:
+        q_emb = embed_query(q_meta["pergunta"], emb_model, emb_tokenizer)
+        retrieved_per_question.append(retrieve(q_emb, index, chunks, top_k=top_k))
+        print(f"      {q_meta['id']} recuperado ({top_k} chunks)")
+
+    # Descarrega modelo de embeddings para liberar VRAM
+    print("\n[04] Descarregando modelo de embeddings da VRAM...")
+    del emb_model, emb_tokenizer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        free = torch.cuda.mem_get_info()[0] / 1e9
+        print(f"[04] VRAM livre após descarregar embeddings: {free:.1f} GB")
+
     # ------------------------------------------------------------------
-    # Modelo de geração (Qwen3.5-9B)
+    # FASE 2 — Modelo de geração
     # ------------------------------------------------------------------
     print(f"\n[04] Carregando tokenizer de geração: {gen_model_name}")
     gen_tokenizer = AutoTokenizer.from_pretrained(gen_model_name, trust_remote_code=True)
@@ -412,9 +429,9 @@ def run_qa(
     print(f"[04] Gen model device: {next(gen_model.parameters()).device}")
 
     # ------------------------------------------------------------------
-    # Processa cada pergunta
+    # FASE 3 — Gera respostas com os chunks já recuperados
     # ------------------------------------------------------------------
-    print(f"\n[04] Processando {len(QUESTIONS)} perguntas com top_k={top_k}...\n")
+    print(f"\n[04] Gerando {len(QUESTIONS)} respostas...\n")
 
     all_answers = []
     md_blocks   = [
@@ -428,22 +445,17 @@ def run_qa(
         "\n---\n",
     ]
 
-    q_iter = enumerate(QUESTIONS, 1)
+    q_iter = enumerate(zip(QUESTIONS, retrieved_per_question), 1)
     if tqdm:
         q_iter = tqdm(list(q_iter), desc="Perguntas", unit="q")
 
-    for q_idx, q_meta in q_iter:
+    for q_idx, (q_meta, retrieved) in q_iter:
         question = q_meta["pergunta"]
         print(f"\n[04] {q_meta['id']}: {q_meta['tema']}")
 
-        # a) Embedding da pergunta
         t0 = time.time()
-        q_emb = embed_query(question, emb_model, emb_tokenizer)
 
-        # b) Retrieval
-        retrieved = retrieve(q_emb, index, chunks, top_k=top_k)
-
-        # c) Contexto
+        # c) Contexto (retrieval já feito na fase 1)
         context = build_context(retrieved)
 
         # d) Geração
