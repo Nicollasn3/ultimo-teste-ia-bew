@@ -21,22 +21,22 @@ pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
 
 # Instala versões compatíveis conforme CUDA  (sem --quiet para ver erros)
 if [[ "$CUDA_VER" == "12."* ]]; then
-    echo "      Instalando torch 2.3.1 + torchvision 0.18.1 para CUDA 12.1..."
+    echo "      Instalando torch 2.5.1 + torchvision 0.20.1 para CUDA 12.1..."
     pip install \
-        torch==2.3.1 \
-        torchvision==0.18.1 \
-        torchaudio==2.3.1 \
+        torch==2.5.1 \
+        torchvision==0.20.1 \
+        torchaudio==2.5.1 \
         --index-url https://download.pytorch.org/whl/cu121
 elif [[ "$CUDA_VER" == "11.8"* ]]; then
-    echo "      Instalando torch 2.3.1 + torchvision 0.18.1 para CUDA 11.8..."
+    echo "      Instalando torch 2.5.1 + torchvision 0.20.1 para CUDA 11.8..."
     pip install \
-        torch==2.3.1 \
-        torchvision==0.18.1 \
-        torchaudio==2.3.1 \
+        torch==2.5.1 \
+        torchvision==0.20.1 \
+        torchaudio==2.5.1 \
         --index-url https://download.pytorch.org/whl/cu118
 else
     echo "      AVISO: CUDA não detectado — instalando build CPU..."
-    pip install torch==2.3.1 torchvision==0.18.1
+    pip install torch==2.5.1 torchvision==0.20.1
 fi
 
 # Verifica se torch foi instalado corretamente
