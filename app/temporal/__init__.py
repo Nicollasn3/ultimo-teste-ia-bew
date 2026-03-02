@@ -1,1 +1,0 @@
-"""Temporal integration package."""

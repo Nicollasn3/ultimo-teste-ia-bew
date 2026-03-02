@@ -1,123 +1,105 @@
 #!/bin/bash
-# setup_runpod.sh — Configura o ambiente RunPod (GPU A40/CUDA) para o RAG Fonseca
+# =============================================================================
+# setup_runpod.sh — Instala todas as dependências do pipeline no RunPod
+# =============================================================================
 set -e
 
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Setup RunPod: Qwen3-Embedding-4B + Ministral-3:8b          ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
-echo
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[SETUP]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+die()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# ── 1. Detectar versão CUDA e instalar torch compatível ──────────────────────
-echo "[1/4] Detectando CUDA..."
+log "=== Pipeline GLM-OCR + Qwen RAG — Setup RunPod ==="
+log "Data: $(date)"
 
-CUDA_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+\.[0-9]+' | head -1)
-echo "      CUDA detectado: ${CUDA_VER:-não encontrado}"
-echo "      Python: $(python3 --version)"
-echo "      pip: $(pip3 --version)"
-
-# Remove torch/torchvision instalados (versões incompatíveis)
-echo "      Removendo torch/torchvision antigos..."
-pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
-
-# Instala versões compatíveis conforme CUDA  (sem --quiet para ver erros)
-if [[ "$CUDA_VER" == "12."* ]]; then
-    echo "      Instalando torch 2.5.1 + torchvision 0.20.1 para CUDA 12.1..."
-    pip install \
-        torch==2.5.1 \
-        torchvision==0.20.1 \
-        torchaudio==2.5.1 \
-        --index-url https://download.pytorch.org/whl/cu121
-elif [[ "$CUDA_VER" == "11.8"* ]]; then
-    echo "      Instalando torch 2.5.1 + torchvision 0.20.1 para CUDA 11.8..."
-    pip install \
-        torch==2.5.1 \
-        torchvision==0.20.1 \
-        torchaudio==2.5.1 \
-        --index-url https://download.pytorch.org/whl/cu118
+# --------------------------------------------------------------------------
+# Verifica CUDA
+# --------------------------------------------------------------------------
+if command -v nvidia-smi &>/dev/null; then
+    log "GPU detectada:"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 else
-    echo "      AVISO: CUDA não detectado — instalando build CPU..."
-    pip install torch==2.5.1 torchvision==0.20.1
+    warn "nvidia-smi não encontrado — rodando em CPU (muito lento para OCR)"
 fi
 
-# Verifica se torch foi instalado corretamente
-echo ""
-echo "      Verificando torch..."
-python3 -c "
+PYTHON=$(command -v python3 || command -v python || die "Python não encontrado")
+log "Python: $($PYTHON --version)"
+
+PIP="$PYTHON -m pip"
+
+# --------------------------------------------------------------------------
+# Atualiza pip e instala pacotes base
+# --------------------------------------------------------------------------
+log "Atualizando pip..."
+$PIP install --upgrade pip --quiet
+
+log "Instalando dependências base..."
+$PIP install --upgrade \
+    pymupdf \
+    pillow \
+    tqdm \
+    numpy \
+    --quiet
+
+log "Instalando PyTorch (CUDA 12.1)..."
+$PIP install --upgrade \
+    torch \
+    torchvision \
+    torchaudio \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    --quiet
+
+log "Instalando Transformers e utilitários..."
+$PIP install --upgrade \
+    transformers \
+    accelerate \
+    sentencepiece \
+    protobuf \
+    einops \
+    tokenizers \
+    --quiet
+
+log "Instalando FAISS (GPU)..."
+$PIP install faiss-gpu --quiet 2>/dev/null || {
+    warn "faiss-gpu falhou, instalando faiss-cpu..."
+    $PIP install faiss-cpu --quiet
+}
+
+log "Instalando utilitários de texto..."
+$PIP install --upgrade \
+    tiktoken \
+    regex \
+    --quiet
+
+# --------------------------------------------------------------------------
+# Verifica torch + CUDA
+# --------------------------------------------------------------------------
+log "Verificando torch + CUDA..."
+$PYTHON - <<'PYEOF'
 import torch
-print(f'      torch     : {torch.__version__}')
-print(f'      CUDA ok   : {torch.cuda.is_available()}')
+print(f"  torch   : {torch.__version__}")
+print(f"  CUDA    : {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f'      GPU       : {torch.cuda.get_device_name(0)}')
-    print(f'      VRAM      : {torch.cuda.get_device_properties(0).total_memory // 1024**3} GB')
-"
+    print(f"  device  : {torch.cuda.get_device_name(0)}")
+    print(f"  VRAM    : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+PYEOF
 
-# ── 2. Instalar dependências Python ──────────────────────────────────────────
-echo ""
-echo "[2/4] Instalando dependências Python..."
-pip install \
-    "transformers>=4.51.0" \
-    "huggingface_hub>=0.20" \
-    "numpy" \
-    "requests" \
-    "accelerate"
+# --------------------------------------------------------------------------
+# Cria estrutura de diretórios
+# --------------------------------------------------------------------------
+log "Criando estrutura de diretórios..."
+mkdir -p pipeline data output/pages output/chunks
 
-# Verifica transformers
-python3 -c "import transformers; print(f'      transformers: {transformers.__version__}')"
-echo "      OK"
-
-# ── 3. Configurar cache HuggingFace em storage persistente (se disponível) ───
-echo ""
-echo "[3/4] Configurando paths..."
-
-# /runpod-volume é o storage persistente entre reinicializações do RunPod
-if [ -d "/runpod-volume" ]; then
-    HF_CACHE="/runpod-volume/hf_cache"
-    echo "      Storage persistente detectado → HF_HOME=$HF_CACHE"
+# Move o PDF para data/ se ainda estiver na raiz
+PDF_SRC="FONSECA, Ricardo Marcelo. Introdução Teórica à História do Direito.pdf"
+if [ -f "$PDF_SRC" ] && [ ! -f "data/fonseca.pdf" ]; then
+    cp "$PDF_SRC" data/fonseca.pdf
+    log "PDF copiado para data/fonseca.pdf"
+elif [ -f "data/fonseca.pdf" ]; then
+    log "PDF já está em data/fonseca.pdf"
 else
-    HF_CACHE="/workspace/hf_cache"
-    echo "      Sem /runpod-volume → HF_HOME=$HF_CACHE (temporário)"
+    warn "PDF não encontrado em '$PDF_SRC'. Coloque o PDF em data/fonseca.pdf manualmente."
 fi
 
-mkdir -p "$HF_CACHE"
-
-# Salva .env para o script Python carregar
-WORKSPACE_DIR=$(dirname "$(realpath "$0")")
-cat > "$WORKSPACE_DIR/.env_rag" << EOF
-export HF_HOME=$HF_CACHE
-export HUGGINGFACE_HUB_CACHE=$HF_CACHE
-export OLLAMA_URL=http://localhost:11434
-export OLLAMA_MODEL=ministral-3:8b
-EOF
-
-echo "      .env_rag salvo em: $WORKSPACE_DIR/.env_rag"
-
-# ── 4. Verificar / Instalar Ollama e baixar modelo ───────────────────────────
-echo ""
-echo "[4/4] Configurando Ollama..."
-
-if ! command -v ollama &> /dev/null; then
-    echo "      Instalando Ollama..."
-    curl -fsSL https://ollama.com/install.sh | sh
-else
-    echo "      Ollama já instalado: $(ollama --version 2>/dev/null || echo 'ok')"
-fi
-
-# Inicia Ollama em background se não estiver rodando
-if ! curl -sf "http://localhost:11434/api/tags" > /dev/null 2>&1; then
-    echo "      Iniciando servidor Ollama..."
-    ollama serve > /tmp/ollama.log 2>&1 &
-    sleep 5
-fi
-
-echo "      Baixando ministral-3:8b (~6 GB)..."
-ollama pull ministral-3:8b
-
-echo ""
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Setup concluído!                                           ║"
-echo "║                                                              ║"
-echo "║  Para rodar (no mesmo diretório do script):                 ║"
-echo "║    source .env_rag                                          ║"
-echo "║    ollama serve &                                            ║"
-echo "║    python3 test_rag_fonseca.py                              ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+log "=== Setup concluído! ==="
+log "Execute: bash run.sh"
