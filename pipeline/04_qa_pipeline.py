@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import re
 import sys
 import textwrap
 import time
@@ -212,14 +213,37 @@ SYSTEM_PROMPT = textwrap.dedent("""\
     **exclusivamente com base nos trechos fornecidos** do livro "Introdução Teórica
     à História do Direito" de Ricardo Marcelo Fonseca.
 
-    Regras:
+    Regras OBRIGATÓRIAS:
+    - Todo o seu raciocínio interno (thinking) DEVE ser escrito em português do Brasil.
+    - Sua resposta final também deve ser em português do Brasil.
     - Cite explicitamente a página, o autor e o trecho relevante em cada ponto da resposta.
     - Use o formato: (Fonseca, p. X — linhas Y-Z: "trecho literal curto")
     - Se os trechos fornecidos não forem suficientes para responder com segurança,
       diga isso claramente.
-    - Responda em português do Brasil.
     - Seja preciso, acadêmico e direto.
 """).strip()
+
+# ---------------------------------------------------------------------------
+# Extrai e separa bloco de thinking da resposta final
+# ---------------------------------------------------------------------------
+_THINK_TAG_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def split_thinking_and_answer(text: str) -> tuple[str, str]:
+    """
+    Retorna (thinking, answer).
+    Suporta:
+      - <think>...</think> (Qwen3 padrão)
+      - Texto livre sem tags (thinking integrado ao texto)
+    """
+    match = _THINK_TAG_RE.search(text)
+    if match:
+        thinking = match.group(1).strip()
+        answer   = _THINK_TAG_RE.sub("", text).strip()
+        return thinking, answer
+
+    # Sem tags: tudo é resposta (o modelo já não separou)
+    return "", text.strip()
 
 
 def build_context(retrieved_chunks: List[Dict[str, Any]]) -> str:
@@ -256,31 +280,41 @@ def generate_answer(
     gen_model: AutoModelForCausalLM,
     gen_tokenizer: AutoTokenizer,
     max_new_tokens: int = 1024,
-) -> str:
-    """Gera resposta usando chat template se disponível."""
+) -> tuple[str, str]:
+    """
+    Gera resposta com thinking ativado.
+    Retorna (thinking_pt, answer_pt).
+    """
     device = next(gen_model.parameters()).device
 
-    # Tenta chat template (modelos instruct)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"TRECHOS DO LIVRO:\n{context}\n\n"
+                f"PERGUNTA:\n{question}"
+            ),
+        },
+    ]
+
+    # Ativa thinking explicitamente (Qwen3); fallback sem o parâmetro
     try:
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"TRECHOS DO LIVRO:\n{context}\n\n"
-                    f"PERGUNTA:\n{question}"
-                ),
-            },
-        ]
         inputs_text = gen_tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=True,
         )
-        use_chat = True
-    except Exception:
-        inputs_text = build_prompt(question, context, use_chat_template=False)
-        use_chat = False
+    except TypeError:
+        try:
+            inputs_text = gen_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            inputs_text = build_prompt(question, context, use_chat_template=False)
 
     encoded = gen_tokenizer(inputs_text, return_tensors="pt", truncation=True, max_length=4096).to(device)
 
@@ -296,8 +330,10 @@ def generate_answer(
         )
 
     new_ids = out_ids[0][encoded["input_ids"].shape[1]:]
-    answer = gen_tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-    return answer
+    # skip_special_tokens=False para preservar <think>...</think>
+    raw = gen_tokenizer.decode(new_ids, skip_special_tokens=False).strip()
+    thinking, answer = split_thinking_and_answer(raw)
+    return thinking, answer
 
 
 # ============================================================================
@@ -306,6 +342,7 @@ def generate_answer(
 
 def format_answer_md(
     q_meta: Dict[str, str],
+    thinking: str,
     answer: str,
     retrieved: List[Dict[str, Any]],
     q_index: int,
@@ -318,6 +355,23 @@ def format_answer_md(
         "",
         "---",
         "",
+    ]
+
+    # Bloco de raciocínio (colapsável em markdown)
+    if thinking:
+        lines += [
+            "<details>",
+            "<summary>💭 Raciocínio do modelo (clique para expandir)</summary>",
+            "",
+            thinking,
+            "",
+            "</details>",
+            "",
+            "---",
+            "",
+        ]
+
+    lines += [
         "### Resposta",
         "",
         answer,
@@ -459,7 +513,7 @@ def run_qa(
         context = build_context(retrieved)
 
         # d) Geração
-        answer = generate_answer(
+        thinking, answer = generate_answer(
             question=question,
             context=context,
             gen_model=gen_model,
@@ -467,10 +521,10 @@ def run_qa(
             max_new_tokens=max_new_tokens,
         )
         elapsed = time.time() - t0
-        print(f"      Tempo: {elapsed:.1f}s | Resposta: {len(answer)} chars")
+        print(f"      Tempo: {elapsed:.1f}s | Raciocínio: {len(thinking)} chars | Resposta: {len(answer)} chars")
 
         # e) Formata
-        md_block = format_answer_md(q_meta, answer, retrieved, q_idx, len(QUESTIONS))
+        md_block = format_answer_md(q_meta, thinking, answer, retrieved, q_idx, len(QUESTIONS))
         md_blocks.append(md_block)
         md_blocks.append("\n---\n")
 
@@ -479,6 +533,7 @@ def run_qa(
             "id":        q_meta["id"],
             "tema":      q_meta["tema"],
             "pergunta":  question,
+            "raciocinio": thinking,
             "resposta":  answer,
             "fontes": [
                 {
