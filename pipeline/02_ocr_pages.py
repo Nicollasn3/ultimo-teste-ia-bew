@@ -26,6 +26,15 @@ try:
 except ImportError:
     sys.exit("[ERRO] transformers/torch não instalados. Execute setup_runpod.sh")
 
+# Desabilita o limite de tamanho de imagem do Pillow (PDFs de alta resolução
+# podem exceder o limite padrão de ~178MP que o PIL usa como proteção anti-DoS).
+# Seguro aqui porque as imagens são geradas localmente pelo step 01.
+try:
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+except ImportError:
+    pass
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -115,6 +124,8 @@ def run_glm_ocr(
             ],
         }]
 
+        inputs = None
+        generated_ids = None
         try:
             inputs = processor.apply_chat_template(
                 messages,
@@ -143,6 +154,15 @@ def run_glm_ocr(
             print(f"\n[02][WARN] Falha na página {page_num}: {exc}")
             page_text = f"[OCR FALHOU: {exc}]"
 
+        finally:
+            # Libera VRAM independente de sucesso ou falha
+            if inputs is not None:
+                del inputs
+            if generated_ids is not None:
+                del generated_ids
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
         elapsed = time.time() - t0
 
         # ---- Salva .txt individual
@@ -164,10 +184,6 @@ def run_glm_ocr(
             "elapsed_sec": round(elapsed, 2),
             "file": str(page_txt_path),
         })
-
-        # Libera VRAM entre páginas
-        del inputs, generated_ids
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ------------------------------------------------------------------
     # Monta markdown final na ordem das páginas
